@@ -414,6 +414,7 @@ class ToolCallsValidator:
             request_id = None
             created = None
             full_content = []
+            full_reasoning_content = []
             tool_calls: Dict[int, Dict[str, Any]] = {}
             finish_reason = None
             usage = None
@@ -439,6 +440,10 @@ class ToolCallsValidator:
                     if hasattr(choice.delta, "content") and choice.delta.content:
                         full_content.append(choice.delta.content)
 
+                    # Accumulate reasoning content
+                    if hasattr(choice.delta, "reasoning_content") and choice.delta.reasoning_content:
+                        full_reasoning_content.append(choice.delta.reasoning_content)
+
                     # Accumulate tool calls
                     if hasattr(choice.delta, "tool_calls") and choice.delta.tool_calls:
                         self._accumulate_tool_calls(choice.delta.tool_calls, tool_calls)
@@ -457,6 +462,7 @@ class ToolCallsValidator:
 
             # Extract tool calls from text if using completions endpoint
             content_text = "".join(full_content)
+            reasoning_content_text = "".join(full_reasoning_content) if full_reasoning_content else None
             if self.use_raw_completions:
                 extracted_tool_calls = extract_tool_call_info(content_text)
                 if extracted_tool_calls:
@@ -465,6 +471,16 @@ class ToolCallsValidator:
 
             # Convert tool_calls to list
             tool_calls_list = list(tool_calls.values()) if tool_calls else None
+
+            # Build message dict
+            message_dict = {
+                "role": "assistant",
+                "content": content_text,
+                "tool_calls": tool_calls_list,
+            }
+            # Add reasoning_content if present
+            if reasoning_content_text:
+                message_dict["reasoning_content"] = reasoning_content_text
 
             # Construct response
             response = {
@@ -475,11 +491,7 @@ class ToolCallsValidator:
                 "choices": [
                     {
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": content_text,
-                            "tool_calls": tool_calls_list,
-                        },
+                        "message": message_dict,
                         "finish_reason": finish_reason or "stop",
                     }
                 ],
