@@ -1,36 +1,43 @@
-"""
-Tool Calls Validator - Validates LLM model's tool call functionality
-
-Features:
-- Concurrent request processing
-- Incremental mode (rerun only failed requests)
-- Stream and non-stream responses
-- Real-time statistics updates
-- Support for both chat/completions and completions APIs
-"""
-
 import argparse
 import asyncio
 import hashlib
 import json
 import os
+import random
 import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
 import megfile
+from h2.exceptions import H2Error
+from httpcore import ConnectError as HttpcoreConnectError
+from httpcore import ConnectTimeout as HttpcoreConnectTimeout
+from httpcore import ReadError as HttpcoreReadError
+from httpcore import RemoteProtocolError
 from jsonschema import ValidationError, validate
 from loguru import logger
-from openai import AsyncOpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+    RateLimitError,
+)
 from tqdm.asyncio import tqdm_asyncio
 from transformers import AutoTokenizer
 
 DEFAULT_CONCURRENCY = 5
 DEFAULT_TIMEOUT = 600
 DEFAULT_MAX_RETRIES = 3
+DEFAULT_RATE_LIMIT_BASE_DELAY = 2.0
+DEFAULT_RATE_LIMIT_MAX_DELAY = 60.0
 DEFAULT_OUTPUT_FILE = "results.jsonl"
 DEFAULT_SUMMARY_FILE = "summary.json"
+
+# Unlimited read timeout for streaming; allow slow model output.
+HTTPX_STREAM_TIMEOUT = httpx.Timeout(timeout=None, connect=60.0)
 
 # Role constants
 ROLE_INPUT = "_input"
@@ -44,16 +51,50 @@ TOOL_CALL_ARG_BEGIN = "<|tool_call_argument_begin|>"
 TOOL_CALL_END = "<|tool_call_end|>"
 
 
+RETRYABLE_READ_ERRORS = (
+    HttpcoreConnectError,
+    HttpcoreConnectTimeout,
+    HttpcoreReadError,
+    RemoteProtocolError,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+)
+
+
+def _compute_backoff_delay(attempt: int) -> float:
+    """Exponential backoff with jitter, capped at DEFAULT_RATE_LIMIT_MAX_DELAY."""
+    delay = min(DEFAULT_RATE_LIMIT_BASE_DELAY * (2**attempt), DEFAULT_RATE_LIMIT_MAX_DELAY)
+    return delay + (delay * random.uniform(0, 0.25))
+
+
+def _is_retryable_exception(e: BaseException) -> bool:
+    """Return True for errors that should be retried indefinitely."""
+    if isinstance(e, RateLimitError):
+        return True
+    if isinstance(e, APIStatusError):
+        return getattr(e, "status_code", None) == 429
+    # HTTP/2 state/protocol errors from 'h2' can surface without being wrapped by httpx/httpcore.
+    if isinstance(e, H2Error):
+        return True
+    if isinstance(e, (APIConnectionError, APITimeoutError, *RETRYABLE_READ_ERRORS)):
+        return True
+    return False
+
+
+def _serialize_error(e: BaseException) -> Dict[str, str]:
+    """Serialize exception for JSONL output."""
+    return {
+        "error_type": type(e).__name__,
+        "error_message": str(e),
+        # Backward-compatible field
+        "error": str(e),
+    }
+
+
 def extract_tool_call_info(tool_call_rsp: str) -> List[Dict[str, Any]]:
-    """
-    Extract tool call information from raw text response.
-
-    Args:
-        tool_call_rsp: Raw model response text
-
-    Returns:
-        List of tool calls, each containing id, type, and function fields
-    """
+    """Extract tool call info from raw text responses (completions endpoint)."""
     if TOOL_CALLS_BEGIN not in tool_call_rsp:
         return []
 
@@ -97,29 +138,13 @@ def extract_tool_call_info(tool_call_rsp: str) -> List[Dict[str, Any]]:
 
 
 def compute_hash(obj: Dict[str, Any]) -> str:
-    """
-    Compute stable hash of request object for incremental mode.
-
-    Args:
-        obj: Request object dictionary
-
-    Returns:
-        MD5 hash string
-    """
+    """Compute a stable hash for incremental mode."""
     serialized = json.dumps(obj, sort_keys=True, ensure_ascii=False)
     return hashlib.md5(serialized.encode("utf-8")).hexdigest()
 
 
 class ToolCallsValidator:
-    """
-    Tool Calls Validator.
-
-    Responsibilities:
-    1. Send concurrent API requests
-    2. Validate tool call arguments against schema
-    3. Collect and aggregate results
-    4. Support incremental mode to avoid re-running successful requests
-    """
+    """Validate tool calls and accumulate per-request results."""
 
     def __init__(
         self,
@@ -191,13 +216,25 @@ class ToolCallsValidator:
 
         self.results: List[Dict[str, Any]] = []
         self.finish_reason_stat: Dict[str, int] = {}
+        self.eval_start_ts: Optional[float] = None
+        self.eval_end_ts: Optional[float] = None
+        self.eval_started_at: Optional[str] = None
+        self.eval_finished_at: Optional[str] = None
 
-        # Initialize OpenAI client
+        self.http_client = httpx.AsyncClient(
+            http2=True,
+            timeout=HTTPX_STREAM_TIMEOUT,
+            limits=httpx.Limits(
+                max_connections=concurrency * 2,
+                max_keepalive_connections=concurrency,
+            ),
+        )
         self.client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
             timeout=self.timeout,
             max_retries=self.max_retries,
+            http_client=self.http_client,
         )
 
         # Async locks
@@ -234,34 +271,19 @@ class ToolCallsValidator:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """
-        Async context manager exit, cleanup resources.
-
-        Args:
-            exc_type: Exception type if an exception was raised
-            exc_val: Exception value if an exception was raised
-            exc_tb: Exception traceback if an exception was raised
-
-        Returns:
-            False to propagate exceptions
-        """
         try:
             await self.client.close()
             logger.debug("AsyncOpenAI client closed successfully")
         except Exception as e:
             logger.warning(f"Error closing AsyncOpenAI client: {e}")
+        try:
+            await self.http_client.aclose()
+        except Exception as e:
+            logger.warning(f"Error closing httpx client: {e}")
         return False
 
     def prepare_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Preprocess request, set model and parameters.
-
-        Args:
-            request: Raw request dictionary
-
-        Returns:
-            Processed request dictionary
-        """
+        """Preprocess request and apply CLI overrides."""
         req = request.copy()
 
         # Handle special _input role (convert to system)
@@ -279,6 +301,14 @@ class ToolCallsValidator:
             req["temperature"] = self.temperature
         if self.max_tokens is not None:
             req["max_tokens"] = self.max_tokens
+
+        # Ensure streaming usage is included.
+        if req.get("stream", False) and not self.use_raw_completions:
+            so = req.get("stream_options")
+            if not isinstance(so, dict):
+                so = {}
+            so.setdefault("include_usage", True)
+            req["stream_options"] = so
 
         # Convert messages to prompt if using completions endpoint
         if self.use_raw_completions and self.tokenizer:
@@ -360,147 +390,124 @@ class ToolCallsValidator:
         return results
 
     async def send_request(self, request: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        """
-        Send API request (supports both stream and non-stream).
+        """Send a single request; retry indefinitely on retryable errors."""
+        attempt = 0
+        while True:
+            try:
+                # Only limit concurrency during actual network I/O.
+                async with self.semaphore:
+                    return await self._send_once(request)
+            except Exception as e:
+                if not _is_retryable_exception(e):
+                    logger.error(f"Request failed: {e}")
+                    return "failed", _serialize_error(e)
 
-        Args:
-            request: Request parameters dictionary
+                delay = _compute_backoff_delay(attempt)
+                attempt += 1
+                logger.warning(
+                    f"Retryable error ({type(e).__name__}), attempt {attempt}, "
+                    f"retrying in {delay:.1f}s: {e}"
+                )
+                await asyncio.sleep(delay)
 
-        Returns:
-            Tuple of (status, response dict), status is either "success" or "failed"
-        """
-        try:
-            if request.get("stream", False):
-                return await self._handle_stream_request(request)
-            else:
-                # Non-stream request
-                if not self.use_raw_completions:
-                    response = await self.client.chat.completions.create(
-                        **request, extra_body=self.extra_body
-                    )
-                else:
-                    response = await self.client.completions.create(
-                        **request, extra_body=self.extra_body
-                    )
-                return "success", response.model_dump()
-        except Exception as e:
-            logger.error(f"Request failed: {e}")
-            return "failed", {"error": str(e)}
+    async def _send_once(self, request: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """Perform one network attempt (may raise)."""
+        if request.get("stream", False):
+            return await self._handle_stream_request(request)
+
+        if not self.use_raw_completions:
+            response = await self.client.chat.completions.create(**request, extra_body=self.extra_body)
+        else:
+            response = await self.client.completions.create(**request, extra_body=self.extra_body)
+
+        return "success", response.model_dump()
 
     async def _handle_stream_request(
         self, request: Dict[str, Any]
     ) -> Tuple[str, Dict[str, Any]]:
-        """
-        Handle stream request.
+        """Accumulate a streaming response into a non-stream response dict."""
+        if not self.use_raw_completions:
+            stream = await self.client.chat.completions.create(**request, extra_body=self.extra_body)
+        else:
+            stream = await self.client.completions.create(**request, extra_body=self.extra_body)
 
-        Args:
-            request: Request parameters dictionary
+        request_id = None
+        created = None
+        full_content: List[str] = []
+        full_reasoning_content: List[str] = []
+        tool_calls: Dict[int, Dict[str, Any]] = {}
+        finish_reason = None
+        usage = None
 
-        Returns:
-            Tuple of (status, response dict)
-        """
-        try:
-            # Create stream request
-            if not self.use_raw_completions:
-                stream = await self.client.chat.completions.create(
-                    **request, extra_body=self.extra_body
-                )
-            else:
-                stream = await self.client.completions.create(
-                    **request, extra_body=self.extra_body
-                )
+        async for event in stream:
+            if getattr(event, "id", None):
+                request_id = event.id
+            if getattr(event, "created", None):
+                created = event.created
 
-            # Initialize accumulation variables
-            request_id = None
-            created = None
-            full_content = []
-            full_reasoning_content = []
-            tool_calls: Dict[int, Dict[str, Any]] = {}
-            finish_reason = None
-            usage = None
+            if not getattr(event, "choices", None):
+                logger.warning("Empty choices in stream event")
+                continue
 
-            # Process stream events
-            async for event in stream:
-                # Extract metadata
-                if hasattr(event, "id") and event.id:
-                    request_id = event.id
-                if hasattr(event, "created") and event.created:
-                    created = event.created
+            choice = event.choices[0]
 
-                # Check choices
-                if not hasattr(event, "choices") or not event.choices:
-                    logger.warning("Empty choices in stream event")
-                    continue
+            if getattr(choice, "delta", None):
+                delta = choice.delta
+                if getattr(delta, "content", None):
+                    full_content.append(delta.content)
 
-                choice = event.choices[0]
+                if getattr(delta, "reasoning_content", None):
+                    full_reasoning_content.append(delta.reasoning_content)
 
-                # Handle delta content (chat.completions)
-                if hasattr(choice, "delta") and choice.delta:
-                    # Accumulate text content
-                    if hasattr(choice.delta, "content") and choice.delta.content:
-                        full_content.append(choice.delta.content)
+                if getattr(delta, "tool_calls", None):
+                    self._accumulate_tool_calls(delta.tool_calls, tool_calls)
 
-                    # Accumulate reasoning content
-                    if hasattr(choice.delta, "reasoning_content") and choice.delta.reasoning_content:
-                        full_reasoning_content.append(choice.delta.reasoning_content)
+            elif getattr(choice, "text", None):
+                full_content.append(choice.text)
 
-                    # Accumulate tool calls
-                    if hasattr(choice.delta, "tool_calls") and choice.delta.tool_calls:
-                        self._accumulate_tool_calls(choice.delta.tool_calls, tool_calls)
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason
 
-                # Handle text content (completions)
-                elif hasattr(choice, "text") and choice.text:
-                    full_content.append(choice.text)
+            if getattr(choice, "usage", None):
+                usage = choice.usage
 
-                # Extract finish_reason
-                if hasattr(choice, "finish_reason") and choice.finish_reason:
-                    finish_reason = choice.finish_reason
+        # Normalize usage to a plain dict for JSON serialization.
+        if usage is not None and hasattr(usage, "model_dump"):
+            usage = usage.model_dump()
 
-                # Extract usage
-                if hasattr(choice, "usage") and choice.usage:
-                    usage = choice.usage
+        content_text = "".join(full_content)
+        reasoning_content_text = "".join(full_reasoning_content) if full_reasoning_content else None
+        if self.use_raw_completions:
+            extracted_tool_calls = extract_tool_call_info(content_text)
+            if extracted_tool_calls:
+                tool_calls = {i: tc for i, tc in enumerate(extracted_tool_calls)}
+                finish_reason = "tool_calls"
 
-            # Extract tool calls from text if using completions endpoint
-            content_text = "".join(full_content)
-            reasoning_content_text = "".join(full_reasoning_content) if full_reasoning_content else None
-            if self.use_raw_completions:
-                extracted_tool_calls = extract_tool_call_info(content_text)
-                if extracted_tool_calls:
-                    tool_calls = {i: tc for i, tc in enumerate(extracted_tool_calls)}
-                    finish_reason = "tool_calls"
+        tool_calls_list = list(tool_calls.values()) if tool_calls else None
 
-            # Convert tool_calls to list
-            tool_calls_list = list(tool_calls.values()) if tool_calls else None
+        message_dict: Dict[str, Any] = {
+            "role": "assistant",
+            "content": content_text,
+            "tool_calls": tool_calls_list,
+        }
+        if reasoning_content_text:
+            message_dict["reasoning_content"] = reasoning_content_text
 
-            # Build message dict
-            message_dict = {
-                "role": "assistant",
-                "content": content_text,
-                "tool_calls": tool_calls_list,
-            }
-            # Add reasoning_content if present
-            if reasoning_content_text:
-                message_dict["reasoning_content"] = reasoning_content_text
-
-            # Construct response
-            response = {
-                "id": request_id,
-                "object": "chat.completion",
-                "created": created,
-                "model": request.get("model", ""),
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": message_dict,
-                        "finish_reason": finish_reason or "stop",
-                    }
-                ],
-                "usage": usage,
-            }
-            return "success", response
-        except Exception as e:
-            logger.error(f"Stream request handling failed: {e}")
-            return "failed", {"error": str(e)}
+        response = {
+            "id": request_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": request.get("model", ""),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message_dict,
+                    "finish_reason": finish_reason or "stop",
+                }
+            ],
+            "usage": usage,
+        }
+        return "success", response
 
     def _accumulate_tool_calls(
         self, delta_tool_calls: List[Any], tool_calls: Dict[int, Dict[str, Any]]
@@ -543,40 +550,37 @@ class ToolCallsValidator:
         Returns:
             Result dictionary
         """
-        async with self.semaphore:
-            start_time = time.time()
-            status, response = await self.send_request(prepared_req["prepared"])
-            duration_ms = int((time.time() - start_time) * 1000)
+        start_time = time.time()
+        status, response = await self.send_request(prepared_req["prepared"])
+        duration_ms = int((time.time() - start_time) * 1000)
 
-            finish_reason = None
-            tool_calls_valid = None
+        finish_reason = None
+        tool_calls_valid = None
 
-            # Extract finish_reason and validate tool calls
-            if response and "choices" in response and response["choices"]:
-                choice = response["choices"][0]
-                finish_reason = choice.get("finish_reason")
+        if response and "choices" in response and response["choices"]:
+            choice = response["choices"][0]
+            finish_reason = choice.get("finish_reason")
 
-                # Validate parameters if tool call
-                if finish_reason == "tool_calls":
-                    tools = prepared_req["raw"].get("tools", [])
-                    tool_calls = choice.get("message", {}).get("tool_calls", [])
-                    if tool_calls:
-                        tool_calls_valid = all(
-                            self.validate_tool_call(tc, tools) for tc in tool_calls
-                        )
+            if finish_reason == "tool_calls":
+                tools = prepared_req["raw"].get("tools", [])
+                tool_calls = choice.get("message", {}).get("tool_calls", [])
+                if tool_calls:
+                    tool_calls_valid = all(
+                        self.validate_tool_call(tc, tools) for tc in tool_calls
+                    )
 
-            result = {
-                "data_index": data_index,
-                "request": prepared_req["prepared"],
-                "response": response,
-                "status": status,
-                "finish_reason": finish_reason,
-                "tool_calls_valid": tool_calls_valid,
-                "last_run_at": datetime.now().isoformat(),
-                "duration_ms": duration_ms,
-                "hash": prepared_req["hash"],
-            }
-            return result
+        result = {
+            "data_index": data_index,
+            "request": prepared_req["prepared"],
+            "response": response,
+            "status": status,
+            "finish_reason": finish_reason,
+            "tool_calls_valid": tool_calls_valid,
+            "last_run_at": datetime.now().isoformat(),
+            "duration_ms": duration_ms,
+            "hash": prepared_req["hash"],
+        }
+        return result
 
     def validate_tool_call(
         self, tool_call: Dict[str, Any], tools: List[Dict[str, Any]]
@@ -642,6 +646,11 @@ class ToolCallsValidator:
         Args:
             file_path: Test set file path (JSONL format)
         """
+        self.eval_start_ts = time.time()
+        self.eval_end_ts = None
+        self.eval_started_at = datetime.now().isoformat()
+        self.eval_finished_at = None
+
         # Read all requests
         all_requests = self.read_jsonl(file_path)
         if not all_requests:
@@ -712,6 +721,9 @@ class ToolCallsValidator:
 
         # Final processing: deduplicate and sort results
         await self.deduplicate_and_sort_results()
+
+        self.eval_end_ts = time.time()
+        self.eval_finished_at = datetime.now().isoformat()
 
         # Final summary update
         await self.update_summary_file()
@@ -810,12 +822,7 @@ class ToolCallsValidator:
             json.dump(summary, f, ensure_ascii=False, indent=4)
 
     def compute_summary(self) -> Dict[str, Any]:
-        """
-        Compute summary statistics from results list (backward compatibility).
-
-        Returns:
-            Summary dictionary
-        """
+        """Compute summary stats from self.results."""
         summary = {
             "model": self.model,
             "success_count": 0,
@@ -826,12 +833,33 @@ class ToolCallsValidator:
             "finish_others_detail": {},
             "schema_validation_error_count": 0,
             "successful_tool_call_count": 0,
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+            "eval_started_at": self.eval_started_at,
+            "eval_finished_at": self.eval_finished_at,
+            "eval_duration_ms": None,
         }
 
         for r in self.results:
             status = r.get("status")
             finish_reason = r.get("finish_reason")
             tool_calls_valid = r.get("tool_calls_valid")
+
+            # Usage
+            usage = (r.get("response") or {}).get("usage")
+            if isinstance(usage, dict):
+                pt = usage.get("prompt_tokens")
+                ct = usage.get("completion_tokens")
+                tt = usage.get("total_tokens")
+                if isinstance(pt, int):
+                    summary["usage"]["prompt_tokens"] += pt
+                if isinstance(ct, int):
+                    summary["usage"]["completion_tokens"] += ct
+                if isinstance(tt, int):
+                    summary["usage"]["total_tokens"] += tt
 
             if status == "success":
                 summary["success_count"] += 1
@@ -850,6 +878,10 @@ class ToolCallsValidator:
                 summary["finish_others"] += 1
                 summary["finish_others_detail"].setdefault(finish_reason, 0)
                 summary["finish_others_detail"][finish_reason] += 1
+
+        if isinstance(self.eval_start_ts, (int, float)):
+            end_ts = self.eval_end_ts if isinstance(self.eval_end_ts, (int, float)) else time.time()
+            summary["eval_duration_ms"] = int(max(0.0, (end_ts - self.eval_start_ts) * 1000))
 
         self.summary = summary
         return summary
