@@ -1,5 +1,7 @@
 # K2 Vendor Verifier
 
+## We've updated the evaluation approach for kimi-vendor-verifier. Click [here](https://www.kimi.com/blog/kimi-vendor-verifier.html) for more details.
+
 ## What's K2VV
 
 Since the release of the Kimi K2 model, we have received numerous feedback on the precision of Kimi K2 in toolcall. Given that K2 focuses on the agentic loop, the reliability of toolcall is of utmost importance.
@@ -391,6 +393,22 @@ python tool_calls_eval.py samples.jsonl \
     --concurrency 5 \
     --extra-body '{"provider": {"only": ["YOUR_DESIGNATED_PROVIDER"]}}'
 ```
+
+### Note for Kimi K2.5 Model Testing
+
+For third-party APIs deployed with vLLM/SGLang/KTransformers, please note that:
+
+- To use **Instant mode** (disable thinking), you need to pass `{"chat_template_kwargs": {"thinking": false}}` in `extra_body`:
+
+```bash
+python tool_calls_eval.py samples.jsonl \
+    --model kimi-k2.5 \
+    --base-url YOUR_API_BASE_URL \
+    --api-key YOUR_API_KEY \
+    --concurrency 5 \
+    --extra-body '{"chat_template_kwargs": {"thinking": false}, "temperature": 0.6}'
+```
+
 ## Contact Us
 **We're preparing the next benchmark round and need your input.**
 
@@ -399,4 +417,4 @@ If there's any **metric or test case** you care about, please drop a note in [is
 And welcome to drop the name of any vendor you’d like to see in in [issue](https://github.com/MoonshotAI/K2-Vendor-Verifier/issues/10)
 
 ---
-If you have any questions or concerns, please reach out to us at shijuanfeng@moonshot.cn.
+If you have any questions or concerns, please reach out to us at contact-kvv@kimi.com.
