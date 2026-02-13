@@ -60,7 +60,9 @@ RETRYABLE_READ_ERRORS = (
 
 def _compute_backoff_delay(attempt: int) -> float:
     """Exponential backoff with jitter, capped at DEFAULT_RATE_LIMIT_MAX_DELAY."""
-    delay = min(DEFAULT_RATE_LIMIT_BASE_DELAY * (2**attempt), DEFAULT_RATE_LIMIT_MAX_DELAY)
+    delay = min(
+        DEFAULT_RATE_LIMIT_BASE_DELAY * (2**attempt), DEFAULT_RATE_LIMIT_MAX_DELAY
+    )
     return delay + (delay * random.uniform(0, 0.25))
 
 
@@ -282,6 +284,14 @@ class ToolCallsValidator:
             for message in req["messages"]:
                 if message.get("role") == ROLE_INPUT:
                     message["role"] = ROLE_SYSTEM
+                # For thinking models (e.g. kimi-k2.5), assistant messages with
+                # tool_calls must include a reasoning_content field.
+                if (
+                    message.get("role") == "assistant"
+                    and message.get("tool_calls")
+                    and "reasoning_content" not in message
+                ):
+                    message["reasoning_content"] = " "
 
         # Set model
         if self.model:
@@ -401,27 +411,180 @@ class ToolCallsValidator:
                 )
                 await asyncio.sleep(delay)
 
+    def _raw_request_headers(self) -> Dict[str, str]:
+        """Build HTTP headers for raw httpx requests."""
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _raise_for_api_status(self, resp: httpx.Response) -> None:
+        """Raise an appropriate OpenAI SDK exception for error HTTP responses."""
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"error": {"message": resp.text}}
+        msg = f"Error code: {resp.status_code} - {body}"
+        if resp.status_code == 429:
+            raise RateLimitError(message=msg, response=resp, body=body)
+        raise APIStatusError(message=msg, response=resp, body=body)
+
     async def _send_once(self, request: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """Perform one network attempt (may raise)."""
         if request.get("stream", False):
             return await self._handle_stream_request(request)
 
-        if not self.use_raw_completions:
-            response = await self.client.chat.completions.create(**request, extra_body=self.extra_body)
-        else:
-            response = await self.client.completions.create(**request, extra_body=self.extra_body)
+        if self.use_raw_completions:
+            response = await self.client.completions.create(
+                **request, extra_body=self.extra_body
+            )
+            return "success", response.model_dump()
 
-        return "success", response.model_dump()
+        # For chat completions, use raw httpx to preserve extra message fields
+        # (e.g. reasoning_content) that the OpenAI SDK strips during serialization.
+        body = {**request, **self.extra_body}
+        resp = await self.http_client.post(
+            f"{self.base_url}/chat/completions",
+            json=body,
+            headers=self._raw_request_headers(),
+        )
+        if resp.status_code >= 400:
+            self._raise_for_api_status(resp)
+        return "success", resp.json()
 
     async def _handle_stream_request(
         self, request: Dict[str, Any]
     ) -> Tuple[str, Dict[str, Any]]:
         """Accumulate a streaming response into a non-stream response dict."""
-        if not self.use_raw_completions:
-            stream = await self.client.chat.completions.create(**request, extra_body=self.extra_body)
-        else:
-            stream = await self.client.completions.create(**request, extra_body=self.extra_body)
+        if self.use_raw_completions:
+            stream = await self.client.completions.create(
+                **request, extra_body=self.extra_body
+            )
+            return await self._accumulate_sdk_stream(stream, request)
 
+        # For chat completions, use raw httpx streaming to preserve extra
+        # message fields (e.g. reasoning_content) in the request body.
+        body = {**request, **self.extra_body}
+
+        # # Debug: verify reasoning_content on ALL assistant messages
+        # for i, msg in enumerate(body.get("messages", [])):
+        #     if isinstance(msg, dict) and msg.get("role") == "assistant":
+        #         tc = msg.get("tool_calls")
+        #         has_rc = "reasoning_content" in msg
+        #         logger.info(
+        #             f"Message[{i}]: assistant, "
+        #             f"tool_calls={type(tc).__name__}({bool(tc)}), "
+        #             f"reasoning_content present={has_rc}, "
+        #             f"value={repr(msg.get('reasoning_content', 'N/A'))}"
+        #         )
+
+        request_id = None
+        created = None
+        full_content: List[str] = []
+        full_reasoning_content: List[str] = []
+        tool_calls: Dict[int, Dict[str, Any]] = {}
+        finish_reason = None
+        usage = None
+
+        async with self.http_client.stream(
+            "POST",
+            f"{self.base_url}/chat/completions",
+            json=body,
+            headers=self._raw_request_headers(),
+        ) as resp:
+            if resp.status_code >= 400:
+                await resp.aread()
+                self._raise_for_api_status(resp)
+
+            async for line in resp.aiter_lines():
+                line = line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:") :].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse SSE event: {data[:200]}")
+                    continue
+
+                if event.get("id"):
+                    request_id = event["id"]
+                if event.get("created"):
+                    created = event["created"]
+
+                choices = event.get("choices")
+                if not choices:
+                    if event.get("usage"):
+                        usage = event["usage"]
+                    continue
+
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+
+                if delta.get("content"):
+                    full_content.append(delta["content"])
+                if delta.get("reasoning_content"):
+                    full_reasoning_content.append(delta["reasoning_content"])
+                if delta.get("tool_calls"):
+                    for tc in delta["tool_calls"]:
+                        idx = tc.get("index", 0)
+                        if idx not in tool_calls:
+                            tool_calls[idx] = {
+                                "id": tc.get("id"),
+                                "type": tc.get("type", "function"),
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        func = tc.get("function") or {}
+                        if func.get("name"):
+                            tool_calls[idx]["function"]["name"] = func["name"]
+                        if func.get("arguments"):
+                            tool_calls[idx]["function"]["arguments"] += func[
+                                "arguments"
+                            ]
+
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+                if choice.get("usage"):
+                    usage = choice["usage"]
+                if event.get("usage"):
+                    usage = event["usage"]
+
+        content_text = "".join(full_content)
+        reasoning_content_text = (
+            "".join(full_reasoning_content) if full_reasoning_content else None
+        )
+        tool_calls_list = list(tool_calls.values()) if tool_calls else None
+
+        message_dict: Dict[str, Any] = {
+            "role": "assistant",
+            "content": content_text,
+            "tool_calls": tool_calls_list,
+        }
+        if reasoning_content_text:
+            message_dict["reasoning_content"] = reasoning_content_text
+
+        response = {
+            "id": request_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": request.get("model", ""),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message_dict,
+                    "finish_reason": finish_reason or "stop",
+                }
+            ],
+            "usage": usage,
+        }
+        return "success", response
+
+    async def _accumulate_sdk_stream(
+        self, stream: Any, request: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Accumulate a stream from the OpenAI SDK (raw completions) into a response dict."""
         request_id = None
         created = None
         full_content: List[str] = []
@@ -467,7 +630,9 @@ class ToolCallsValidator:
             usage = usage.model_dump()
 
         content_text = "".join(full_content)
-        reasoning_content_text = "".join(full_reasoning_content) if full_reasoning_content else None
+        reasoning_content_text = (
+            "".join(full_reasoning_content) if full_reasoning_content else None
+        )
         if self.use_raw_completions:
             extracted_tool_calls = extract_tool_call_info(content_text)
             if extracted_tool_calls:
@@ -763,7 +928,9 @@ class ToolCallsValidator:
             logger.info("No results to process")
             return
 
-        logger.info(f"Processing {len(all_results)} results for deduplication and sorting")
+        logger.info(
+            f"Processing {len(all_results)} results for deduplication and sorting"
+        )
 
         # Group by data_index and keep the latest one for each index
         results_by_index: Dict[int, Dict[str, Any]] = {}
@@ -872,8 +1039,14 @@ class ToolCallsValidator:
                 summary["finish_others_detail"][finish_reason] += 1
 
         if isinstance(self.eval_start_ts, (int, float)):
-            end_ts = self.eval_end_ts if isinstance(self.eval_end_ts, (int, float)) else time.time()
-            summary["eval_duration_ms"] = int(max(0.0, (end_ts - self.eval_start_ts) * 1000))
+            end_ts = (
+                self.eval_end_ts
+                if isinstance(self.eval_end_ts, (int, float))
+                else time.time()
+            )
+            summary["eval_duration_ms"] = int(
+                max(0.0, (end_ts - self.eval_start_ts) * 1000)
+            )
 
         self.summary = summary
         return summary
