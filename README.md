@@ -9,7 +9,7 @@ A multi-model tool call evaluation framework for OpenAI-compatible APIs. Tests w
 uv sync
 
 # Run evaluation
-python -m vendor_verifier ./tool-calls/samples.jsonl \
+python -m vendor_verifier ./tool-calls/samples_cleaned_cleaned.jsonl \
     --model gpt-4o \
     --base-url https://api.openai.com/v1 \
     --api-key YOUR_API_KEY
@@ -57,7 +57,7 @@ python -m vendor_verifier <file_path> --model <MODEL> --base-url <URL> [options]
 ### Test any OpenAI-compatible provider
 
 ```bash
-python -m vendor_verifier samples.jsonl \
+python -m vendor_verifier samples_cleaned_cleaned.jsonl \
     --model gpt-4o \
     --base-url https://api.openai.com/v1 \
     --api-key $OPENAI_API_KEY \
@@ -69,7 +69,7 @@ python -m vendor_verifier samples.jsonl \
 ### Test Kimi model via official API
 
 ```bash
-python -m vendor_verifier samples.jsonl \
+python -m vendor_verifier samples_cleaned_cleaned.jsonl \
     --model kimi-k2-0905-preview \
     --base-url https://api.moonshot.cn/v1 \
     --api-key $MOONSHOT_API_KEY \
@@ -79,7 +79,7 @@ python -m vendor_verifier samples.jsonl \
 ### Test via OpenRouter with a specific provider
 
 ```bash
-python -m vendor_verifier samples.jsonl \
+python -m vendor_verifier samples_cleaned_cleaned.jsonl \
     --model moonshotai/kimi-k2-0905 \
     --base-url https://openrouter.ai/api/v1 \
     --api-key $OPENROUTER_API_KEY \
@@ -90,7 +90,7 @@ python -m vendor_verifier samples.jsonl \
 ### Incremental mode (resume after interruption)
 
 ```bash
-python -m vendor_verifier samples.jsonl \
+python -m vendor_verifier samples_cleaned_cleaned.jsonl \
     --model gpt-4o \
     --base-url https://api.openai.com/v1 \
     --incremental
